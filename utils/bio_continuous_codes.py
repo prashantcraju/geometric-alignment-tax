@@ -115,6 +115,16 @@ _AA_HBOND = {
     "I": 0, "L": 0, "K": 2, "M": 0, "F": 0, "P": 0, "S": 2, "T": 2, "W": 1,
     "Y": 2, "V": 0,
 }
+# Cβ-branching: Val, Ile, Thr have a side-chain branch at the beta carbon.
+# This is the one feature that cleanly separates Ile from the otherwise
+# near-identical Leu (same volume, weight, hydropathy, charge, polarity).
+# Without it the physchem code has a structural I/L degeneracy that caps
+# masked-recovery accuracy independently of the objective.
+_AA_CBETA_BRANCH = {
+    "A": 0, "R": 0, "N": 0, "D": 0, "C": 0, "Q": 0, "E": 0,
+    "G": 0, "H": 0, "I": 1, "L": 0, "K": 0, "M": 0, "F": 0,
+    "P": 0, "S": 0, "T": 1, "W": 0, "Y": 0, "V": 1,
+}
 
 _AA_PROPERTY_TABLES = [
     ("hydropathy", _AA_HYDROPATHY),
@@ -125,6 +135,7 @@ _AA_PROPERTY_TABLES = [
     ("weight", _AA_WEIGHT),
     ("aromaticity", _AA_AROMATIC),
     ("hbond", _AA_HBOND),
+    ("cbeta_branch", _AA_CBETA_BRANCH),
 ]
 
 
@@ -229,11 +240,20 @@ def _zscore_property_matrix(alphabet: Sequence[str], tables) -> tuple:
 
 
 def _random_orthonormal_codes(n_tokens: int, d: int, seed: int) -> np.ndarray:
-    """``n_tokens`` rows of a random (semi-)orthonormal matrix in R^d.
+    """Fixed random code matrix in R^d, one row per token.
 
-    Built from a QR decomposition so rows are unit-norm and mutually orthogonal
-    (when ``n_tokens <= d``). This is the biologically-arbitrary but
-    identity-preserving control target.
+    Rows are **fully orthonormal** (unit-norm and mutually orthogonal) when
+    ``n_tokens <= d``, constructed via QR decomposition of a random matrix.
+    When ``n_tokens > d`` exact orthonormality is geometrically impossible;
+    rows are normalized Gaussian (unit-norm, identity-preserving, but not
+    mutually orthogonal). In either case the codes are biologically arbitrary
+    and serve as the objective-form confound control.
+
+    Note on protein (K=20) and DNA (K=4): with ``d_code = 9`` (protein) or
+    ``d_code = 4`` (DNA) the random arm has K > d, so protein random codes
+    are normalized Gaussian, not orthonormal. The high-dimensional control
+    arm (``Cont-highdim``, ``d = VOCAB_SIZE``) always satisfies K ≤ d and is
+    therefore fully orthonormal.
     """
     rng = np.random.default_rng(seed)
     if n_tokens <= d:
@@ -328,8 +348,10 @@ def build_protein_codes(
     Parameters
     ----------
     kind : {'physchem', 'random'}
-        ``physchem`` -> standardized 8-D biophysical property vector.
-        ``random``   -> fixed random orthonormal code (the confound control).
+        ``physchem`` -> standardized 9-D biophysical property vector (including
+        Cβ-branching to break the Ile/Leu degeneracy).
+        ``random``   -> fixed random code (fully orthonormal when ``K ≤ d``,
+        normalized Gaussian otherwise; the confound control).
     d : int, optional
         Code dimensionality. Defaults to 8 (the number of physchem features) so
         the two flavours share an output dimension and are directly comparable.
@@ -513,11 +535,16 @@ if __name__ == "__main__":
         print(f"--- {name} ---")
         phys = builder(kind="physchem", seed=320)
         rand = builder(kind="random", d=phys.d, seed=320)
-        print(f"  physchem: codes {phys.codes.shape}, d={phys.d}, "
+        rand_hd = builder(kind="random", d=len(alpha) + 5, seed=320)  # K ≤ d → fully orthonormal
+        print(f"  physchem:  codes {phys.codes.shape}, d={phys.d}, "
               f"min_pairwise={phys.min_pairwise_distance():.4f}, "
               f"feats={phys.feature_names}")
-        print(f"  random:   codes {rand.codes.shape}, d={rand.d}, "
-              f"min_pairwise={rand.min_pairwise_distance():.4f}")
+        print(f"  random:    codes {rand.codes.shape}, d={rand.d}, "
+              f"min_pairwise={rand.min_pairwise_distance():.4f}  "
+              f"({'orthonormal' if len(alpha) <= rand.d else 'normalized Gaussian'})")
+        print(f"  random_hd: codes {rand_hd.codes.shape}, d={rand_hd.d}, "
+              f"min_pairwise={rand_hd.min_pairwise_distance():.4f}  "
+              f"({'orthonormal' if len(alpha) <= rand_hd.d else 'normalized Gaussian'})")
 
         # Identity must be perfectly recoverable from the exact codes.
         for cb in (phys, rand):
@@ -538,7 +565,15 @@ if __name__ == "__main__":
         c0 = phys.prototypes[:, 0]
         monotone = np.all(np.diff(c0) > 0) or np.all(np.diff(c0) < 0)
         assert not monotone, f"{name}: physchem code is monotone in index (leak!)"
-        print("  non-monotone in token index: OK (no staircase leak)\n")
+        print("  non-monotone in token index: OK (no staircase leak)")
+
+        # For protein: verify Ile (I) and Leu (L) are now distinct after Cβ-branch fix.
+        if name == "PROTEIN":
+            I_id = phys.token_to_id['I']; L_id = phys.token_to_id['L']
+            IL_dist = float(np.linalg.norm(phys.codes[I_id] - phys.codes[L_id]))
+            assert IL_dist > 0.05, f"I/L still degenerate after Cβ-branch fix (dist={IL_dist:.4f})"
+            print(f"  I/L distance after Cβ-branch fix: {IL_dist:.4f}  (was ~0 before)")
+        print()
 
     # Procrustes distortion sanity: rigid rotation -> ~0, reshuffle -> larger.
     rng = np.random.default_rng(320)
